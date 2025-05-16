@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from test import fetch_dataframe
+# from test import fetch_dataframe
 from textblob import TextBlob
 import pickle
 from transformers import pipeline
@@ -13,6 +13,7 @@ from scipy import sparse
 from features import extract_features
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
 
 def get_connection_course():
     return psycopg2.connect(
@@ -49,24 +50,29 @@ def get_lis_courses():
 # with open(model_path_1, "rb") as f:
 #     model = pickle.load(f)
 
+import test
 # Hàm cập nhật model + log thời gian
-# def update_model_and_log():
-#     try:
-#         trained_model.train_and_save_model()
-#         global model
-#         with open(model_path_1, "rb") as f:
-#             model = pickle.load(f)
-#         print(f"🔁 Model đã được cập nhật lại lúc {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-#     except Exception as e:
-#         print(f"❌ Lỗi khi cập nhật model: {e}")
-#
-#
-# # Khởi tạo và lên lịch cho APScheduler
-# scheduler = BackgroundScheduler()
-# scheduler.add_job(update_model_and_log, 'interval', minutes=5)
-# scheduler.start()
+def update_model_and_log():
+    try:
+        test.train_and_save_model()
+        print(f"🔁 Model đã được cập nhật lại lúc {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as e:
+        print(f"❌ Lỗi khi cập nhật model: {e}")
+
+
+# Khởi tạo và lên lịch cho APScheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(update_model_and_log, 'interval', minutes=5)
+scheduler.start()
 
 app = Flask(__name__)
+
+
+def fetch_dataframe(connection_func, query):
+    conn = connection_func()
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
 # Load mô hình và encoder
 model_als = joblib.load('model_als.pkl')
@@ -75,13 +81,6 @@ user_encoder = joblib.load('user_encoder.pkl')
 course_encoder = joblib.load('course_encoder.pkl')
 
 user_item_matrix = sparse.load_npz("user_items.npz")
-
-# interactions = pd.read_csv('data_csv/interactions.csv')
-# wishlist = pd.read_csv('data_csv/wishlist.csv')
-# ratings = pd.read_csv('data_csv/courserating.csv')
-# course_metadata = pd.read_csv('data_csv/course.csv')
-
-# global_avg_rating = ratings['rating'].mean()
 
 
 def generate_dummy_data():
@@ -170,7 +169,7 @@ def recommend():
         top = (
             candidate_df
             .sort_values('xgb_score', ascending=False)
-            .head(5)
+            .head(8)
             [['user_id', 'course_id', 'xgb_score']]
         )
 
@@ -186,7 +185,7 @@ item_features_matrix = joblib.load('new-user/item_features_matrix.pkl')
 courses_df = pd.read_pickle('new-user/courses_df.pkl')
 
 
-def recommend_for_new_user(profile, top_k=5):
+def recommend_for_new_user(profile, top_k=8):
     # category_text = ' '.join(profile['category_id']) if isinstance(profile['category_id'], list) else profile[
     #     'category_id']
 

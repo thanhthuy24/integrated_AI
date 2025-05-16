@@ -10,198 +10,220 @@ from scipy import sparse
 import features
 import pandas as pd
 import psycopg2
+import pymysql
+from datetime import datetime
+import traceback
 
-# --------------------------
-# 1. TẠO DỮ LIỆU GIẢ LẬP
-# --------------------------
+def train_and_save_model():
+    # --------------------------
+    # 1. TẠO DỮ LIỆU GIẢ LẬP
+    # --------------------------
 
 
-def get_connection_course():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        database="course",
-        user="postgres",
-        password="Admin123@"
+    def get_connection_course():
+        return psycopg2.connect(
+            host="localhost",
+            port=5432,
+            database="course",
+            user="postgres",
+            password="Admin123@"
+        )
+
+    def get_connection_enrollment():
+        return psycopg2.connect(
+            host="localhost",
+            port=5432,
+            database="enrollment",
+            user="postgres",
+            password="Admin123@"
+        )
+
+    def get_connection_user():
+        return pymysql.connect(
+            host="localhost",
+            port=3306,
+            user="root",
+            password="Admin123@",
+            database="elearningdb",
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+
+    def fetch_dataframe(connection_func, query):
+        conn = connection_func()
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+
+
+    def generate_dummy_data():
+        # interactions = pd.read_csv('data_update/interactions.csv', quotechar='"')
+        # wishlist = pd.read_csv('data_update/wishlist.csv', quotechar='"')
+        # ratings = pd.read_csv('data_update/courserating.csv', quotechar='"')
+        # course_metadata = pd.read_csv('data_csv/course.csv')
+
+        interactions = fetch_dataframe(get_connection_enrollment, "SELECT * FROM interactions")
+        wishlist = fetch_dataframe(get_connection_course, "SELECT * FROM wishlist")
+        ratings = fetch_dataframe(get_connection_enrollment, "SELECT * FROM courserating")
+        course_metadata = fetch_dataframe(get_connection_course, "SELECT * FROM course")
+        users_df = fetch_dataframe(get_connection_user, "SELECT id AS user_id FROM user")
+
+        return interactions, wishlist, ratings, course_metadata, users_df
+
+
+    interactions, wishlist, ratings, course_metadata, users_df = generate_dummy_data()
+
+    # --------------------------
+    # 2. XỬ LÝ DỮ LIỆU CHO IMPLICIT ALS
+    # --------------------------
+    # Fix OpenBLAS warning
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+    user_encoder = LabelEncoder()
+    user_encoder.fit(users_df['user_id'])
+    course_encoder = LabelEncoder()
+
+    interactions['user_encoded'] = user_encoder.fit_transform(interactions['user_id'])
+    interactions['course_encoded'] = course_encoder.fit_transform(interactions['course_id'])
+
+    # Tính trọng số
+    interactions['weight'] = interactions['purchased'] * 3 + interactions['clicks'] * 0.2
+
+    # Chuyển sang CSR format (Implicit yêu cầu)
+    user_item_matrix = csr_matrix(
+        (interactions['weight'],
+         (interactions['user_encoded'], interactions['course_encoded'])),
+         shape=(len(user_encoder.classes_), len(course_encoder.classes_))
     )
 
-def get_connection_enrollment():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        database="enrollment",
-        user="postgres",
-        password="Admin123@"
+    # --------------------------
+    # 3. HUẤN LUYỆN IMPLICIT ALS
+    # --------------------------
+    print("\n🔄 Training Implicit ALS model...")
+    model_implicit = implicit.als.AlternatingLeastSquares(
+        factors=64,
+        iterations=20,
+        calculate_training_loss=True,
+        random_state=42
     )
 
+    model_implicit.fit(user_item_matrix)
 
-def fetch_dataframe(connection_func, query):
-    conn = connection_func()
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
+    # Đề xuất candidates
+    user_id_map = {user: idx for idx, user in enumerate(user_encoder.classes_)}
+    candidates = {}
+    for user in interactions['user_id'].unique():
+        user_encoded = user_id_map[user]
+        recommended_items, scores = model_implicit.recommend(
+            userid=user_encoded,
+            user_items=user_item_matrix[user_encoded],
+            N=50,
+            filter_already_liked_items=True
+        )
+        candidates[user] = [course_encoder.inverse_transform([course_id])[0] for course_id in recommended_items]
 
+    print("✅ Generated candidates for all users")
 
-def generate_dummy_data():
-    interactions = pd.read_csv('data_update/interactions.csv', quotechar='"')
-    wishlist = pd.read_csv('data_update/wishlist.csv', quotechar='"')
-    ratings = pd.read_csv('data_update/courserating.csv', quotechar='"')
-    course_metadata = pd.read_csv('data_csv/course.csv')
+    # --------------------------
+    # 4. CHUẨN BỊ DỮ LIỆU CHO XGBOOST
+    # --------------------------
+    # Tính rating trung bình toàn hệ thống
+    global_avg_rating = ratings['rating'].mean()
 
-    return interactions, wishlist, ratings, course_metadata
+    features_list = [
+        features.extract_features(user, course, interactions, wishlist, ratings, course_metadata, global_avg_rating)
+        for user, courses in candidates.items()
+        for course in courses
+    ]
 
+    features_df = pd.DataFrame(features_list)
+    features_df = pd.get_dummies(features_df, columns=['category', 'difficulty'])
 
-interactions, wishlist, ratings, course_metadata = generate_dummy_data()
-
-# --------------------------
-# 2. XỬ LÝ DỮ LIỆU CHO IMPLICIT ALS
-# --------------------------
-# Fix OpenBLAS warning
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-
-user_encoder = LabelEncoder()
-course_encoder = LabelEncoder()
-
-interactions['user_encoded'] = user_encoder.fit_transform(interactions['user_id'])
-interactions['course_encoded'] = course_encoder.fit_transform(interactions['course_id'])
-
-# Tính trọng số
-interactions['weight'] = interactions['purchased'] * 3 + interactions['clicks'] * 0.2
-
-# Chuyển sang CSR format (Implicit yêu cầu)
-user_item_matrix = csr_matrix(
-    (interactions['weight'],
-     (interactions['user_encoded'], interactions['course_encoded'])),
-     shape=(len(user_encoder.classes_), len(course_encoder.classes_))
-)
-
-# --------------------------
-# 3. HUẤN LUYỆN IMPLICIT ALS
-# --------------------------
-print("\n🔄 Training Implicit ALS model...")
-model_implicit = implicit.als.AlternatingLeastSquares(
-    factors=64,
-    iterations=20,
-    calculate_training_loss=True,
-    random_state=42
-)
-
-model_implicit.fit(user_item_matrix)
-
-# Đề xuất candidates
-user_id_map = {user: idx for idx, user in enumerate(user_encoder.classes_)}
-candidates = {}
-for user in interactions['user_id'].unique():
-    user_encoded = user_id_map[user]
-    recommended_items, scores = model_implicit.recommend(
-        userid=user_encoded,
-        user_items=user_item_matrix[user_encoded],
-        N=50,
-        filter_already_liked_items=True
+    # Tạo label với trọng số tùy chỉnh (ưu tiên mua > rating > wishlist > click)
+    features_df['raw_score'] = (
+        features_df['is_purchased'] * 1.5 +
+        features_df['in_wishlist'] * 3 +
+        features_df['avg_rating'] +
+        features_df['total_clicks'] * 0.5
     )
-    candidates[user] = [course_encoder.inverse_transform([course_id])[0] for course_id in recommended_items]
 
-print("✅ Generated candidates for all users")
+    # Scale về khoảng [1, 10] và ép kiểu int (cần thiết cho XGBRanker)
+    scaler = MinMaxScaler(feature_range=(1, 10))
+    features_df['label'] = scaler.fit_transform(features_df[['raw_score']]).astype(int)
 
-# --------------------------
-# 4. CHUẨN BỊ DỮ LIỆU CHO XGBOOST
-# --------------------------
-# Tính rating trung bình toàn hệ thống
-global_avg_rating = ratings['rating'].mean()
+    # Xóa cột tạm nếu không cần
+    # features_df.drop(columns=['raw_score'], inplace=True)
 
-features_list = [
-    features.extract_features(user, course, interactions, wishlist, ratings, course_metadata, global_avg_rating)
-    for user, courses in candidates.items()
-    for course in courses
-]
+    # --------------------------
+    # 5. HUẤN LUYỆN XGBOOST RANKER
+    # --------------------------
+    print("\n🔄 Training XGBoost Ranker...")
 
-features_df = pd.DataFrame(features_list)
-features_df = pd.get_dummies(features_df, columns=['category', 'difficulty'])
+    # Reset index để đảm bảo phù hợp
+    features_df = features_df.reset_index(drop=True)
 
-# Tạo label với trọng số tùy chỉnh (ưu tiên mua > rating > wishlist > click)
-features_df['raw_score'] = (
-    features_df['is_purchased'] * 1.5 +
-    features_df['in_wishlist'] * 3 +
-    features_df['total_clicks'] * 0.5
-)
+    # Chia dữ liệu theo user
+    unique_users = features_df['user_id'].unique()
+    train_users, test_users = train_test_split(unique_users, test_size=0.2, random_state=42)
 
-# Scale về khoảng [1, 10] và ép kiểu int (cần thiết cho XGBRanker)
-scaler = MinMaxScaler(feature_range=(1, 10))
-features_df['label'] = scaler.fit_transform(features_df[['raw_score']]).astype(int)
+    train_mask = features_df['user_id'].isin(train_users)
+    test_mask = features_df['user_id'].isin(test_users)
 
-# Xóa cột tạm nếu không cần
-# features_df.drop(columns=['raw_score'], inplace=True)
+    X_train = features_df[train_mask].drop(['user_id', 'course_id', 'label'], axis=1)
+    y_train = features_df[train_mask]['label']
+    X_test = features_df[test_mask].drop(['user_id', 'course_id', 'label'], axis=1)
+    y_test = features_df[test_mask]['label']
 
-# --------------------------
-# 5. HUẤN LUYỆN XGBOOST RANKER
-# --------------------------
-print("\n🔄 Training XGBoost Ranker...")
+    # Tính toán group sizes
+    train_groups = features_df[train_mask].groupby('user_id').size().values
+    test_groups = features_df[test_mask].groupby('user_id').size().values
 
-# Reset index để đảm bảo phù hợp
-features_df = features_df.reset_index(drop=True)
+    model_xgb = XGBRanker(
+        objective='rank:pairwise',
+        tree_method='hist',
+        learning_rate=0.1,
+        n_estimators=100,
+        random_state=42
+    )
 
-# Chia dữ liệu theo user
-unique_users = features_df['user_id'].unique()
-train_users, test_users = train_test_split(unique_users, test_size=0.2, random_state=42)
+    model_xgb.fit(
+        X_train,
+        y_train,
+        group=train_groups,
+        verbose=True
+    )
 
-train_mask = features_df['user_id'].isin(train_users)
-test_mask = features_df['user_id'].isin(test_users)
+    print("✅ XGBoost training completed")
 
-X_train = features_df[train_mask].drop(['user_id', 'course_id', 'label'], axis=1)
-y_train = features_df[train_mask]['label']
-X_test = features_df[test_mask].drop(['user_id', 'course_id', 'label'], axis=1)
-y_test = features_df[test_mask]['label']
+    # --------------------------
+    # 6. DỰ ĐOÁN VÀ HIỂN THỊ KẾT QUẢ
+    # --------------------------
+    features_df['xgb_score'] = model_xgb.predict(features_df.drop(['user_id', 'course_id', 'label'], axis=1))
+    top_recommendations = (
+        features_df
+        .sort_values(['user_id', 'xgb_score'], ascending=[True, False])
+        .groupby('user_id')
+        .head(8)
+    )
 
-# Tính toán group sizes
-train_groups = features_df[train_mask].groupby('user_id').size().values
-test_groups = features_df[test_mask].groupby('user_id').size().values
+    # Lưu model và dữ liệu cần thiết
+    import joblib
 
-model_xgb = XGBRanker(
-    objective='rank:pairwise',
-    tree_method='hist',
-    learning_rate=0.1,
-    n_estimators=100,
-    random_state=42
-)
+    # Sau khi huấn luyện xong
+    joblib.dump(model_xgb, 'xgb_model.pkl')
 
-model_xgb.fit(
-    X_train,
-    y_train,
-    group=train_groups,
-    verbose=True
-)
+    # Lưu các mô hình và encoder
+    joblib.dump(model_implicit, 'model_als.pkl')
+    joblib.dump(model_xgb, 'model_xgb_ranker.pkl')
+    joblib.dump(user_encoder, 'user_encoder.pkl')
+    joblib.dump(scaler, "scaler.pkl")
+    joblib.dump(course_encoder, 'course_encoder.pkl')
 
-print("✅ XGBoost training completed")
+    top_recommendations.to_csv('recommendations.csv', index=False)
 
-# --------------------------
-# 6. DỰ ĐOÁN VÀ HIỂN THỊ KẾT QUẢ
-# --------------------------
-features_df['xgb_score'] = model_xgb.predict(features_df.drop(['user_id', 'course_id', 'label'], axis=1))
-top_recommendations = (
-    features_df
-    .sort_values(['user_id', 'xgb_score'], ascending=[True, False])
-    .groupby('user_id')
-    .head(8)
-)
-
-# Lưu model và dữ liệu cần thiết
-import joblib
-
-# Sau khi huấn luyện xong
-joblib.dump(model_xgb, 'xgb_model.pkl')
-
-# Lưu các mô hình và encoder
-joblib.dump(model_implicit, 'model_als.pkl')
-joblib.dump(model_xgb, 'model_xgb_ranker.pkl')
-joblib.dump(user_encoder, 'user_encoder.pkl')
-joblib.dump(scaler, "scaler.pkl")
-joblib.dump(course_encoder, 'course_encoder.pkl')
-
-top_recommendations.to_csv('recommendations.csv', index=False)
-
-# user_item_matrix là ma trận sparse được dùng trong model.implicit.recommend
-sparse.save_npz("user_items.npz", user_item_matrix)
-print("✅ Saved user_items.npz thành công")
+    # user_item_matrix là ma trận sparse được dùng trong model.implicit.recommend
+    sparse.save_npz("user_items.npz", user_item_matrix)
+    print("✅ Saved user_items.npz thành công")
 
 # import gen_data
 # result = gen_data.evaluate_recommendations(top_recommendations, features_df, k=10)
